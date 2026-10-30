@@ -1,0 +1,1133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>像素追逐</title>
+<style>
+  :root { --bg: #1a1020; --ink: #fff; --accent: #ff5a8a; --gold: #ffd23f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+         display: flex; align-items: center; justify-content: center; padding: 16px;
+         font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', monospace; }
+  .stage { position: relative; width: min(100%, 1280px); aspect-ratio: 16 / 9; overflow: hidden;
+           border: 4px solid #000; box-shadow: 0 0 0 4px var(--gold); background: #000; }
+  #game { display: block; width: 100%; height: 100%; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
+             align-items: center; justify-content: center; background: rgba(26, 16, 32, .55); }
+  .overlay.hidden { display: none; }
+  .btn { font: inherit; font-weight: 700; font-size: clamp(16px, 3vw, 28px); color: var(--bg);
+         background: var(--gold); border: 4px solid #000; box-shadow: 6px 6px 0 #000;
+         padding: 12px 28px; cursor: pointer; animation: hop 1s steps(2) infinite; }
+  .hint { font-size: clamp(12px, 1.6vw, 16px); opacity: .85; text-align: center; }
+  @keyframes hop { 50% { transform: translateY(-3px); } }
+  .mute { position: absolute; right: 10px; bottom: 10px; font: inherit; font-size: 14px; font-weight: 700;
+          color: var(--ink); background: rgba(0,0,0,.55); border: 2px solid #fff; padding: 4px 10px; cursor: pointer; }
+  .banner { position: absolute; left: 50%; top: 22%; transform: translate(-50%, -50%) scale(.6); opacity: 0;
+            font-weight: 900; font-size: clamp(18px, 4.2vw, 46px); color: var(--gold); letter-spacing: .08em;
+            text-shadow: 3px 3px 0 #000, -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000;
+            transition: transform .35s cubic-bezier(.3,1.6,.5,1), opacity .25s; pointer-events: none; white-space: nowrap; }
+  .banner.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  .banner small { display: block; font-size: .42em; color: #fff; text-align: center; letter-spacing: .3em; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <svg id="game" viewBox="0 0 320 180" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">
+    <defs id="defs"></defs>
+    <g id="world">
+      <g id="bg"></g>
+      <g id="props"></g>
+      <g id="actors"></g>
+      <g id="fg"></g>
+      <g id="fx"></g>
+      <g id="talk"></g>
+    </g>
+    <g id="hud"></g>
+  </svg>
+  <div class="banner" id="banner"></div>
+  <div class="overlay" id="overlay">
+    <button class="btn" id="start">▶ 点击开始</button>
+    <div class="hint">有声音，记得开音量</div>
+  </div>
+  <button class="mute" id="mute" hidden>🔊 声音</button>
+</div>
+<script>
+'use strict';
+// ====================================================================
+//  基础
+// ====================================================================
+const NS = 'http://www.w3.org/2000/svg';
+const $ = id => document.getElementById(id);
+const lerp = (a, b, u) => a + (b - a) * u;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const ease = u => u * u * (3 - 2 * u);
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function g(html, parent, attrs = {}) {
+  const e = el('g', attrs, parent);
+  e.innerHTML = html;
+  return e;
+}
+const R = (x, y, w, h, c, extra = '') => `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${c}" ${extra}/>`;
+
+// ====================================================================
+//  像素角色（温知窈 / 裴恕）
+// ====================================================================
+const PAL = {
+  s: '#ffe0cc', e: '#3a2216', c: '#ff9aa8', w: '#ffffff', r: '#e8344e',
+  // 温知窈：棕发、蓝蝶簪、珍珠、浅粉纱衣、粉腰带
+  H: '#6b3e26', b: '#5aa8e8', q: '#f4f0e8', P: '#ffc8da', p: '#f29ab8', R: '#e0607f',
+  // 裴恕：黑纱官帽金框金翅、黑底金龙袍、红衬里
+  K: '#141014', n: '#1e1418', G: '#e4b440', g: '#a87c22', d: '#2c2228', x: '#a01c2c',
+};
+const GIRL_TOP = [
+  ".....HHHH.......", "....HHHHHHbb....", "...HHHHHHHHbb...", "...HHHHHHHHHq...",
+  "..HHHHHsssssH...", "..HHHHssssess...", "..HHHHsssssss...", "..HHHHsssscs....",
+  "..HHHHHsssss....", "..HHHHwPPPws....", "..HHHPPwwPPPP...", "..HHPPPPPPPPs...",
+  "...HPRRRRRRP....", "...HPPPRRPPPP...", "...PPPPRPPPPPP..", "..PPPPPRPPPPPP..",
+  "..PPPPPPPPPPP...", "..PPPpPPPPpPP...", ".PPPPpPPPPpPPP..", ".PPPPpPPPPpPPP..",
+  ".PPPPPPPPPPPPP..", "..PPPPPPPPPPP...",
+];
+const BOY_TOP = [
+  "......GG........", ".....KKKK.......", "....KKKKKK......", "....KKGGKK......",
+  "GG.GGGGGGGG.GG..", "G..nssssssn..G..", "G..nsssesss..G..", "g..nssssss...g..",
+  "...nnssss.......", "..nnwxdddd......", "..nKdwxdddd.....", ".KddGdxddddK....",
+  ".dddGGGGGGGd....", ".sddGdxdGddds...", ".dddGdxddGddd...", "xdddddxddddddx..",
+  "xddGdddxddGdddx.", ".ddddddxdddddd..", ".dGdddxxxdddGd..", ".dddGddxddGddd..",
+  ".dddddddddddddd.", ".GGGGGGGGGGGGGG.",
+];
+const legs = {
+  girlA: ["...pp.....pp....", "...pp.....pp...."], girlB: ["......pppp......", "......pppp......"],
+  girlS: ["....pp...pp.....", "....pp...pp....."],
+  boyA: ["..KK......KK....", "..KK......KK...."], boyB: ["......KKKK......", "......KKKK......"],
+  boyS: ["...KK....KK.....", "...KK....KK....."],
+};
+function edit(rows, cells) {
+  const r = rows.map(s => s.split(''));
+  for (const [x, y, c] of cells) r[y][x] = c;
+  return r.map(a => a.join(''));
+}
+const xEye = (cx, cy) => [[cx-1,cy-1,'e'],[cx+1,cy-1,'e'],[cx,cy,'e'],[cx-1,cy+1,'e'],[cx+1,cy+1,'e']];
+function noHat(rows) {
+  return rows.map((row, y) => {
+    if (y < 4) return '.'.repeat(16);
+    if (y === 4) return '...nnnnnnnn.....';
+    if (y <= 7) return row.split('').map((c, x) => (x === 0 || x === 13) ? '.' : c).join('');
+    return row;
+  });
+}
+const HAT = BOY_TOP.slice(0, 8).map((row, y) => row.split('').map((c, x) =>
+  ((y <= 4 && 'KGg'.includes(c)) || (y >= 5 && (x === 0 || x === 13) && c !== '.')) ? c : '.').join(''));
+
+const GIRL = {
+  runA: GIRL_TOP.concat(legs.girlA), runB: GIRL_TOP.concat(legs.girlB), stand: GIRL_TOP.concat(legs.girlS),
+};
+GIRL.hurt = edit(GIRL.stand, xEye(10, 5));
+GIRL.hurtRun = edit(GIRL.runA, xEye(10, 5));
+GIRL.angry = edit(GIRL.runA, [[9,6,'r'],[10,6,'r'],[11,6,'r'],[9,7,'r'],[10,7,'r'],[9,4,'e'],[10,4,'e']]);
+GIRL.angryB = edit(GIRL.runB, [[9,6,'r'],[10,6,'r'],[11,6,'r'],[9,7,'r'],[10,7,'r'],[9,4,'e'],[10,4,'e']]);
+const BOY = {
+  runA: BOY_TOP.concat(legs.boyA), runB: BOY_TOP.concat(legs.boyB), stand: BOY_TOP.concat(legs.boyS),
+};
+BOY.hurt = edit(BOY.stand, xEye(7, 6));
+BOY.hurtNoHat = noHat(BOY.hurt);
+
+function rowsToSVG(rows) {
+  let s = '';
+  rows.forEach((row, y) => {
+    let x = 0;
+    while (x < row.length) {
+      const ch = row[x];
+      if (ch === '.') { x++; continue; }
+      let x2 = x;
+      while (x2 < row.length && row[x2] === ch) x2++;
+      s += R(x, y, x2 - x, 1, PAL[ch]);
+      x = x2;
+    }
+  });
+  return s;
+}
+
+// 被雪球裹住的温知窈
+function snowballSVG() {
+  let s = '';
+  for (let y = -13; y < 13; y++) {
+    const hw = Math.floor(Math.sqrt(169 - (y + .5) * (y + .5)));
+    s += R(-hw, y, hw * 2, 1, '#ffffff');
+    s += R(Math.max(-hw, hw - 5), y, Math.min(5, hw * 2), 1, '#d6ebf8');
+  }
+  s += R(-4, -15, 8, 3, '#6b3e26') + R(3, -16, 3, 2, '#5aa8e8');   // 头发和蝶簪露在外面
+  s += R(-11, 9, 4, 3, '#f29ab8') + R(7, 9, 4, 3, '#f29ab8');       // 两只脚
+  s += R(-3, -5, 2, 2, '#3a2216') + R(2, -5, 2, 2, '#3a2216');      // 眼睛
+  return s;
+}
+
+// ====================================================================
+//  时间轴：每个角色是一串「段」，按时间求状态
+// ====================================================================
+const EVENTS = [];
+const ev = (t, fn) => EVENTS.push({ t, fn });
+const SAYS = [];
+function say(who, t0, dur, text, dx = 0, dy = 0) {
+  SAYS.push({ who, t0, t1: t0 + dur, text, dx, dy });
+  ev(t0, () => SFX.talk(text.length, who.name));
+}
+
+class Act {
+  constructor(name, x, y, flip = 1) {
+    Object.assign(this, { name, x, y, flip, t: 0, segs: [] });
+  }
+  seg(dur, f) { this.segs.push({ t0: this.t, t1: this.t + dur, f }); this.t += dur; return this; }
+  move(dur, f) {
+    const end = f(1, this.t + dur);
+    this.seg(dur, f);
+    this.x = end.x; this.y = end.y;
+    if (end.flip) this.flip = end.flip;
+    return this;
+  }
+  wait(dur, o = {}) {
+    const { x, y, flip } = this;
+    return this.seg(dur, (u, t) => Object.assign({ x, y, flip, pose: 'stand' }, o, o.fx ? o.fx(u, t) : {}));
+  }
+  until(T, o) {
+    if (T < this.t - 1e-6) console.warn(this.name, 'late by', (this.t - T).toFixed(2), 's');
+    return this.wait(Math.max(0, T - this.t), o);
+  }
+  face(f) { this.flip = f; return this; }
+  run(toX, speed, o = {}) {
+    const x0 = this.x, y = this.y, dur = Math.abs(toX - x0) / speed;
+    const flip = toX >= x0 ? 1 : -1, cad = o.cad || 0.12;
+    this.flip = flip; this.x = toX;
+    const [pa, pb] = o.poses || ['runA', 'runB'];
+    return this.seg(dur, (u, t) => {
+      const ph = Math.floor(t / cad) % 2;
+      return Object.assign({ x: x0 + (toX - x0) * u, y: y - ph, flip, pose: ph ? pa : pb }, o.st);
+    });
+  }
+  jump(toX, toY, h, dur, o = {}) {
+    const crouch = o.crouch ?? 0.08;
+    if (crouch) this.wait(crouch, Object.assign({ sx: 1.25, sy: 0.78 }, o.st, { pose: o.st?.pose || 'stand' }));
+    const x0 = this.x, y0 = this.y, t0 = this.t;
+    if (toX !== x0) this.flip = o.flip ?? (toX > x0 ? 1 : -1);
+    const flip = this.flip;
+    this.x = toX; this.y = toY;
+    if (o.sfx !== null) ev(t0, () => SFX[o.sfx || (this.name === 'girl' ? 'girlJump' : 'boyJump')]());
+    for (const [u, fn] of o.ev || []) ev(t0 + u * dur, fn);
+    this.seg(dur, (u, t) => {
+      const arc = h * (1 - Math.pow(Math.abs(2 * u - 1), 2.2));
+      let sx = 1, sy = 1;
+      if (u < 0.2) { const k = u / 0.2; sx = 0.8 + 0.2 * k; sy = 1.25 - 0.25 * k; }
+      else if (u > 0.8) { const k = (u - 0.8) / 0.2; sx = 1 - 0.1 * k; sy = 1 + 0.12 * k; }
+      const rot = o.spin ? o.spin * 360 * ease(u) : (o.rot ? o.rot(u, t) : 0);
+      return Object.assign({ x: lerp(x0, toX, u), y: lerp(y0, toY, u) - arc, flip, pose: 'runA', sx, sy, rot },
+        o.st, o.fx ? o.fx(u, t) : {});
+    });
+    if (!o.noLand) this.land(o.landSt, o.quiet);
+    return this;
+  }
+  land(st = {}, quiet) {
+    const { x, y, flip } = this;
+    if (!quiet) { const t = this.t; ev(t, () => { SFX.land(); puff(x, y, 4); }); }
+    return this.seg(0.22, u => {
+      const d = 0.35 * Math.exp(-3.5 * u) * Math.cos(2.6 * Math.PI * u);
+      return Object.assign({ x, y, flip, pose: 'stand', sx: 1 + d, sy: 1 - d }, st);
+    });
+  }
+  climb(toY, speed) {
+    const x = this.x, y0 = this.y, dur = Math.abs(toY - y0) / speed;
+    return this.move(dur, (u, t) => {
+      const ph = Math.floor(t / 0.16) % 2;
+      return { x, y: lerp(y0, toY, u), flip: ph ? 1 : -1, pose: ph ? 'runA' : 'runB', climb: true };
+    });
+  }
+  at(t) {
+    const s = this.segs;
+    if (t <= s[0].t0) return s[0].f(0, t);
+    let lo = 0, hi = s.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (s[m].t0 <= t) lo = m; else hi = m - 1; }
+    const sg = s[lo];
+    const u = sg.t1 > sg.t0 ? clamp((t - sg.t0) / (sg.t1 - sg.t0), 0, 1) : 1;
+    return sg.f(u, t);
+  }
+}
+
+// ====================================================================
+//  地图坐标（整张大地图连续，y 向下）
+// ====================================================================
+const GA = 200, GB = 400, GC = 200, GD = 40, GE = 230;   // 雪原 / 火山口 / 草甸 / 高原 / 终点 地面
+const STONES = [985, 1030, 1075, 1120];
+const ROPE = { x0: 2802, y0: -12, x1: 3172, y1: 186 };
+const ropeY = x => ROPE.y0 + (x - ROPE.x0) * (ROPE.y1 - ROPE.y0) / (ROPE.x1 - ROPE.x0);
+const K = {};
+
+// ====================================================================
+//  剧本
+// ====================================================================
+const G = new Act('girl', 40, GA, 1);
+const B = new Act('boy', 130, GA, -1);
+const yakT = { bonk: 0, go: 0, stop: 0 };
+
+// ---------- 1 冰天雪地 ----------
+say(G, 0.2, 1.3, '九千岁，等等我！');
+G.wait(2.2);
+G.run(182, 85);
+// 笨：跳得太矮，脸撞冰块
+G.move(0.2, u => ({ x: 182 + 10 * u, y: GA - 8 * Math.sin(u * Math.PI / 2), pose: 'runA', flip: 1 }));
+K.bonk1 = G.t;
+ev(K.bonk1, () => { SFX.bonk(); stars(200, GA - 12); shake(3); });
+G.move(0.35, u => ({ x: 192 - 22 * u, y: GA - 8 + 12 * u - 10 * Math.sin(u * Math.PI), pose: 'hurt', flip: 1, rot: -90 * u }));
+G.wait(0.8, { pose: 'hurt', rot: -90, dizzy: true });
+say(G, K.bonk1 + 0.4, 0.9, '哎哟…');
+G.move(0.25, u => ({ x: 170, y: GA + 4 - 4 * u, pose: 'stand', flip: 1, rot: -90 + 90 * u }));
+G.jump(234, GA, 34, 0.7, { rot: u => 12 * Math.sin(u * Math.PI * 4), st: { pose: 'hurtRun' } });
+G.run(260, 85);
+K.snowHit = G.t;
+ev(K.snowHit, () => { SFX.splat(); burst(262, GA - 14, 10, ['#fff', '#d6ebf8']); });
+G.move(0.2, u => ({ x: 260, y: GA, flip: 1, ball: true, r: 5 + 8 * u }));
+G.move(0.55, u => ({ x: 260 - 31 * u, y: GA - 6 * Math.sin(u * Math.PI), flip: 1, ball: true, r: 13, rot: -260 * u }));
+ev(G.t, () => { SFX.thud(); shake(4); });
+G.wait(0.35, { ball: true, r: 13, rot: -260, fx: (u, t) => ({ sx: 1 + .08 * Math.sin(t * 50) }) });
+K.burst = G.t;
+ev(K.burst, () => { SFX.crash(); burst(229, GA - 13, 22, ['#fff', '#d6ebf8', '#eaf6ff']); shake(3); });
+G.wait(0.7, { pose: 'angry', angry: true });
+say(G, K.burst + 0.05, 0.9, '可恶！！');
+G.run(372, 170, { st: { dash: true }, poses: ['angry', 'angryB'], cad: 0.07 });
+K.snowman = G.t;
+ev(K.snowman, () => { SFX.crash(); burst(391, GA - 10, 26, ['#fff', '#fff', '#d6245c', '#ff8a1f']); shake(5); });
+G.move(0.5, u => ({ x: 372 + 58 * u, y: GA - 14 * Math.sin(u * Math.PI), pose: 'hurt', flip: 1, rot: 360 * u }));
+G.land({ pose: 'hurt' });
+G.wait(0.3, { pose: 'hurt', dizzy: true });
+G.run(600, 85);
+K.gPipe = G.t;
+say(G, K.gPipe - 1.3, 0.9, '别跑！');
+G.jump(632, 176, 18, 0.45, { noLand: true });
+G.move(0.25, u => ({ x: 632, y: 176 + 14 * u, pose: 'stand', flip: 1 }));
+K.stuck = G.t;
+ev(K.stuck, () => SFX.squeak());
+say(G, K.stuck + 0.1, 1.0, '卡…卡住了！');
+G.wait(1.1, { pose: 'hurt', fx: (u, t) => ({ rot: 9 * Math.sin(t * 28), sweat: true }) });
+ev(G.t, () => SFX.pipe());
+G.move(0.45, u => ({ x: 632, y: 190 + 254 * u * u, pose: 'hurt', flip: 1, rot: 540 * u }));
+ev(G.t, () => { SFX.splat(); shake(3); });
+G.wait(0.15, { pose: 'hurt', sx: 1.4, sy: 0.5, rot: 540 });
+G.move(1.0, u => ({ x: 632 + 248 * u, y: 444, pose: 'hurt', flip: 1, rot: 540 + 1080 * u }));
+G.move(0.3, u => ({ x: 880, y: 444 - 68 * u, pose: 'hurt', flip: 1, rot: 1620 + 180 * u }));
+K.gOut = G.t;
+ev(K.gOut, () => SFX.boing());
+G.jump(945, GB + 4, 70, 0.8, { crouch: 0, noLand: true, rot: u => 1800 + 450 * u, st: { pose: 'hurt' }, sfx: null });
+ev(G.t, () => { SFX.splat(); puff(945, GB, 6); shake(4); });
+G.wait(0.6, { pose: 'hurt', rot: 90, dizzy: true });
+G.move(0.25, u => ({ x: 945, y: GB + 4 - 4 * u, pose: 'stand', flip: 1, rot: 90 - 90 * u }));
+K.gUp = G.t;
+
+// 裴恕：轻松过关，还顺手使坏
+B.wait(1.4, { flip: -1 });
+say(B, 1.4, 1.1, '追得上再说～');
+B.wait(1.0, { flip: -1 });
+B.run(184, 80);
+B.jump(236, GA, 30, 0.6, { spin: 1 });
+B.run(360, 80).face(-1);
+B.until(K.snowHit - 0.85, { flip: -1 });
+B.wait(0.25, { flip: -1, sx: 1.15, sy: 0.85 });
+K.throwSnow = B.t;
+ev(K.throwSnow, () => SFX.throw());
+B.wait(0.3, { flip: -1, pose: 'runA' });
+say(B, K.snowHit - 0.1, 1.0, '哈！正中！');
+B.wait(1.0, { flip: -1, fx: (u, t) => ({ sy: 1 + .06 * Math.abs(Math.sin(t * 18)) }) });
+ev(B.t - 1.0, () => SFX.laugh());
+B.face(1).run(362, 80);
+B.jump(420, GA, 32, 0.55, { spin: 1 });
+B.run(606, 80);
+B.jump(632, 176, 18, 0.45);
+B.face(-1);
+B.until(K.gPipe - 1.6, { flip: -1 });
+say(B, B.t, 0.9, '拜拜～');
+B.wait(0.9, { flip: -1, fx: (u, t) => ({ rot: 6 * Math.sin(t * 14) }) });
+ev(B.t, () => SFX.pipe());
+B.move(0.5, u => ({ x: 632, y: 176 + 38 * u, flip: -1, pose: 'stand' }));
+B.move(0.4, u => ({ x: 632, y: 214 + 230 * u, flip: 1, pose: 'stand' }));
+B.move(1.0, u => ({ x: 632 + 248 * ease(u), y: 444, flip: 1, pose: 'stand' }));
+B.move(0.35, u => ({ x: 880, y: 444 - 68 * u, flip: 1, pose: 'stand' }));
+B.jump(912, GB, 16, 0.45, { crouch: 0 });
+
+// ---------- 2 火山口 ----------
+B.until(K.gOut + 0.6);
+say(B, K.gOut + 0.9, 1.0, '真慢～');
+B.until(K.gUp + 0.3);
+K.bHop = B.t;
+B.run(968, 80);
+for (const [i, sx] of STONES.entries()) {
+  B.jump(sx, GB - 2, 14, 0.32, { crouch: 0, noLand: true, sfx: 'hop' });
+  if (i === 1) { K.stoneTap = B.t; ev(B.t, () => { SFX.crack(); puff(sx, GB, 3, '#6a4a3a'); }); }
+  B.wait(0.06);
+}
+B.jump(1178, GB, 16, 0.4, { crouch: 0 });
+B.run(1238, 80);
+B.jump(1300, GB, 28, 0.5, { spin: 1 });
+B.face(-1);
+
+G.run(968, 85);
+G.until(K.bHop + 1.0);
+G.jump(985, GB - 2, 16, 0.5, { noLand: true });
+say(G, G.t, 0.9, '稳住稳住…');
+G.wait(0.45, { fx: (u, t) => ({ rot: 16 * Math.sin(t * 22), pose: 'hurt' }) });
+G.jump(1030, GB - 2, 16, 0.5, { noLand: true });
+K.sink = G.t;
+ev(K.sink, () => SFX.crack());
+G.move(0.5, (u, t) => ({ x: 1030, y: GB - 2 + 12 * u, pose: 'hurt', flip: 1, rot: 8 * Math.sin(u * 20), sweat: true }));
+K.fire = G.t;
+ev(K.fire, () => { SFX.scream(); burst(1030, GB + 2, 14, ['#ff5a1f', '#ffb02e', '#ffd23f']); shake(4); });
+say(G, K.fire + 0.05, 1.0, '烫烫烫烫！');
+G.jump(1180, GB, 80, 1.0, { crouch: 0, spin: 1, st: { fire: true, pose: 'hurt' }, sfx: null, landSt: { fire: true, pose: 'hurt' } });
+G.run(1225, 170, { st: { fire: true, dash: true }, poses: ['hurtRun', 'hurt'], cad: 0.06 });
+K.flat = G.t;
+const BOULDER = { x: 1275, r: 9, v: 100 };
+K.kick = K.flat - (BOULDER.x - (1225 + 8 + BOULDER.r)) / BOULDER.v;
+ev(K.flat, () => { SFX.thud(); SFX.fizz(); smoke(1225, GB - 4, 8); shake(5); });
+G.wait(0.9, { pose: 'hurt', sx: 1.5, sy: 0.2 });
+ev(G.t, () => SFX.pop());
+G.move(0.35, u => { const d = 0.8 * Math.exp(-5 * u) * Math.cos(3 * Math.PI * u); return { x: 1225, y: GB, flip: 1, pose: 'angry', sx: 1 + d * .6, sy: 1 - d }; });
+say(G, G.t, 1.2, '我跟你没完！');
+G.run(1430, 95, { poses: ['angry', 'angryB'], st: { angry: true } });
+K.gVent = G.t;
+ev(K.gVent + 0.2, () => { SFX.fizz(); smoke(1430, GB, 3); });
+G.wait(0.5);
+G.jump(1430, GB, 10, 0.3, { sfx: 'stomp' });
+G.jump(1430, GB, 10, 0.3, { sfx: 'stomp' });
+G.wait(0.45, { sx: 0.92, sy: 1.08, pose: 'stand' });
+say(G, G.t - 0.45, 0.6, '…？');
+K.E2 = G.t;
+ev(K.E2, () => { SFX.erupt(); shake(8); });
+G.jump(1600, 114, 300, 1.7, { crouch: 0, spin: 3, noLand: true, st: { fire: true, pose: 'hurt' }, sfx: null });
+K.blockA = G.t;
+ev(K.blockA, () => { SFX.bonk(); SFX.coin(); coin(1600, 110); });
+G.jump(1626, GC + 4, 14, 0.45, { crouch: 0, noLand: true, rot: u => 90 * u, st: { pose: 'hurt' }, sfx: null });
+ev(G.t, () => { SFX.splat(); puff(1626, GC, 6); });
+G.wait(0.6, { pose: 'hurt', rot: 90, dizzy: true });
+G.move(0.25, u => ({ x: 1626, y: GC + 4 - 4 * u, pose: 'stand', flip: 1, rot: 90 - 90 * u }));
+K.gMeadow = G.t;
+
+// 裴恕踢石头、坐喷泉
+B.until(K.fire + 0.1, { flip: -1 });
+say(B, K.fire + 0.15, 1.0, '噗——哈哈哈');
+ev(K.fire + 0.15, () => SFX.laugh());
+B.until(K.kick - 0.25, { flip: -1, fx: (u, t) => ({ sy: 1 + .05 * Math.abs(Math.sin(t * 16)) }) });
+B.wait(0.25, { flip: -1, sx: 1.2, sy: 0.85 });
+ev(K.kick, () => { SFX.kick(); SFX.rumble(); });
+say(B, K.kick + 0.05, 1.0, '送你的～');
+B.wait(0.35, { flip: -1, pose: 'runA' });
+B.face(1).run(1430, 85);
+B.wait(0.6, { fx: (u, t) => ({ sy: 1 + .03 * Math.sin(t * 8) }) });
+K.E1 = B.t;
+ev(K.E1, () => { SFX.erupt(); shake(5); });
+B.jump(1580, GC, 200, 1.6, { crouch: 0, pose: 'stand', st: { pose: 'stand' }, sfx: 'whoosh' });
+
+// ---------- 3 草甸 ----------
+B.run(1760, 80).face(-1);
+say(B, B.t + 0.1, 1.0, '这么慢？');
+G.run(1690, 85);
+K.slip = G.t;
+K.ban1 = { t0: K.slip - 0.9, t1: K.slip - 0.4, x: 1690 };
+K.ban2 = { t0: K.slip + 0.2, t1: K.slip + 0.7, x: 1745 };
+ev(K.slip, () => SFX.slip());
+G.move(0.5, u => ({ x: 1690 + 35 * u, y: GC - 16 * Math.sin(u * Math.PI) + 4 * u, pose: 'hurt', flip: 1, rot: -100 * u + (u > .8 ? 10 * (u - .8) * 5 : 0) }));
+ev(G.t, () => { SFX.thud(); puff(1725, GC, 5); shake(3); });
+G.wait(0.7, { pose: 'hurt', rot: -90, dizzy: true });
+say(G, G.t - 0.6, 0.8, '哎呀！');
+G.move(0.25, u => ({ x: 1725, y: GC + 4 - 4 * u, pose: 'stand', flip: 1, rot: -90 + 90 * u }));
+say(G, G.t, 1.0, '哼，同样的招…');
+G.wait(1.0, { fx: (u, t) => ({ sy: 1.05, sx: .97 }) });
+G.jump(1790, 190, 22, 0.5, { noLand: true });
+K.spring = G.t;
+ev(K.spring, () => SFX.spring());
+G.jump(1880, 214, 352, 1.6, { crouch: 0, noLand: true, rot: u => 540 * u, st: { pose: 'hurt' }, sfx: null });
+K.stuckHead = G.t;
+ev(K.stuckHead, () => { SFX.thud(); burst(1880, GC, 14, ['#7a3d10', '#c86a2c', '#3cc463']); shake(5); });
+say(G, K.stuckHead + 0.2, 0.9, '唔唔唔！');
+G.wait(1.1, { pose: 'hurt', fx: (u, t) => ({ rot: 540 + 7 * Math.sin(t * 26) }) });
+K.unstuck = G.t;
+ev(K.unstuck, () => burst(1880, GC, 8, ['#7a3d10', '#c86a2c']));
+G.jump(1905, GC, 26, 0.45, { crouch: 0, rot: u => 540 + 180 * u, st: { pose: 'hurt' }, sfx: 'pop' });
+say(G, G.t, 1.0, '呸呸呸！');
+G.run(2088, 90);
+G.jump(2110, 120, 16, 0.45);
+G.climb(80, 45);
+K.shake = G.t;
+ev(K.shake, () => SFX.shakeVine());
+G.move(0.4, u => ({ x: 2110, y: 80 + 40 * u * u, pose: 'hurt', flip: 1, rot: 20 * Math.sin(u * 12) }));
+G.land({ pose: 'hurt' });
+G.wait(0.5, { pose: 'hurt', dizzy: true });
+say(G, G.t - 0.4, 1.1, '裴恕你——！');
+G.climb(36, 65);
+G.jump(2168, GD, 14, 0.4);
+K.gMesa = G.t;
+
+B.until(K.ban1.t0 - 0.25, { flip: -1 });
+B.wait(0.25, { flip: -1, sx: 1.2, sy: .85 });
+ev(K.ban1.t0, () => SFX.throw());
+B.until(K.ban2.t0 - 0.25, { flip: -1 });
+B.wait(0.25, { flip: -1, sx: 1.2, sy: .85 });
+ev(K.ban2.t0, () => SFX.throw());
+B.wait(0.4, { flip: -1, pose: 'runA' });
+B.face(1).run(2110, 80);
+B.jump(2110, GC, 40, 0.5, { ev: [[0.5, () => { K._ = 0; SFX.bonk(); SFX.vine(); }]] });
+K.vine = B.t - 0.22 - 0.25;
+B.wait(0.5);
+B.jump(2110, 120, 18, 0.45);
+B.climb(36, 75);
+B.jump(2168, GD, 14, 0.4).face(-1);
+B.until(K.shake - 0.1, { flip: -1 });
+say(B, K.shake - 0.1, 1.1, '下去吧你～');
+B.wait(0.7, { flip: -1, fx: (u, t) => ({ rot: 10 * Math.sin(t * 30), pose: 'runA' }) });
+ev(K.shake + 0.4, () => SFX.laugh());
+
+// ---------- 4 高原 ----------
+G.run(2300, 90);
+K.wind = G.t;
+ev(K.wind - 0.3, () => SFX.wind());
+say(G, K.wind + 0.1, 1.0, '风…风好大！');
+G.move(1.2, (u, t) => { const ph = Math.floor(t / 0.05) % 2; return { x: 2300 - 36 * ease(u), y: GD - ph, pose: ph ? 'runA' : 'runB', flip: 1, rot: 14 }; });
+G.run(2578, 135, { poses: ['angry', 'angryB'], cad: 0.07, st: { dash: true } });
+yakT.bonk = G.t;
+ev(yakT.bonk, () => { SFX.bonk(); SFX.moo(); stars(2586, GD - 14); shake(4); });
+G.jump(2600, 24, 30, 0.5, { crouch: 0, noLand: true, st: { pose: 'hurt' }, sfx: null });
+yakT.go = G.t;
+say(G, yakT.go, 1.0, '哇啊啊——');
+G.move(0.95, (u, t) => ({ x: 2600 + 190 * u, y: 24 - 4 * Math.abs(Math.sin(t * 22)), pose: 'hurt', flip: 1, rot: -10 }));
+yakT.stop = G.t;
+ev(yakT.stop, () => SFX.skid());
+G.jump(2830, ropeY(2830) + 26, 40, 0.5, { crouch: 0, spin: 1, noLand: true, sfx: 'boing' });
+K.gZip = G.t;
+ev(K.gZip, () => SFX.zip(1.3));
+const gZipDur = (3165 - 2830) / 260;
+G.move(gZipDur, (u, t) => { const x = 2830 + 335 * u; return { x, y: ropeY(x) + 26, pose: 'hurt', flip: 1, hang: true, rot: -18 + 4 * Math.sin(t * 30), dash: true }; });
+G.jump(3186, GE, 10, 0.25, { crouch: 0, noLand: true, rot: u => -18 + 60 * u, st: { pose: 'hurt' }, sfx: null });
+K.crash = G.t;
+
+B.run(2560, 100);
+B.jump(2650, GD, 30, 0.6, { spin: 1 });
+B.run(2790, 100);
+const bZipDur = (3165 - 2808) / 170;
+const bLand = K.crash - 0.8;
+const bZip = bLand - 0.62 - bZipDur;
+B.until(bZip - 0.48 - 1.0);
+say(B, B.t, 1.0, '再会了～');
+B.wait(1.0, { fx: (u, t) => ({ rot: 5 * Math.sin(t * 10) }) });
+B.jump(2808, ropeY(2808) + 26, 20, 0.4, { noLand: true });
+ev(B.t, () => SFX.zip(bZipDur));
+B.move(bZipDur, u => { const x = 2808 + 357 * u; return { x, y: ropeY(x) + 26, pose: 'stand', flip: 1, hang: true }; });
+B.jump(3190, GE, 14, 0.4, { crouch: 0 });
+B.face(-1);
+ev(K.crash - 0.35, () => SFX.surprise());
+B.until(K.crash, { flip: -1, fx: (u, t) => ({ surprised: t > K.crash - 0.35 }) });
+
+// ---------- 5 终点：撞成一团 ----------
+K.cloudEnd = K.crash + 1.6;
+ev(K.crash, () => { SFX.fight(1.6); shake(6); });
+G.move(1.6, u => ({ x: 3188 + 34 * u, y: GE, hidden: true }));
+B.move(1.6, u => ({ x: 3190 + 34 * u, y: GE, hidden: true }));
+ev(K.cloudEnd, () => { burst(3224, GE - 12, 24, ['#fff', '#ddd', '#ffd23f']); SFX.pop(); });
+B.wait(10, { x: 3230, y: GE + 4, pose: 'hurtNoHat', flip: -1, rot: 90 });
+K.hatLand = K.cloudEnd + 0.6;
+G.move(0.3, u => ({ x: 3226, y: GE - 16, pose: 'stand', flip: 1, sx: 1, sy: 1 }));
+G.until(K.hatLand, { x: 3226, y: GE - 16 });
+ev(K.hatLand, () => SFX.pop());
+G.wait(0.2, { x: 3226, y: GE - 16, hat: true });
+for (let i = 0; i < 2; i++) {
+  G.jump(3226, GE - 16, 10, 0.35, { crouch: 0, st: { hat: true, pose: 'stand' }, sfx: null, quiet: true, landSt: { hat: true } });
+  ev(G.t - 0.22, () => SFX.squeak());
+  K['squish' + i] = G.t - 0.22;
+}
+say(G, K.hatLand + 0.25, 1.7, '抓到你啦！');
+K.heart = K.hatLand + 0.6;
+ev(K.heart, () => SFX.heart());
+say(B, K.hatLand + 2.1, 1.6, '……算你狠', 40, 18);
+K.win = K.hatLand + 2.4;
+ev(K.win, () => { SFX.win(); showWin(); });
+G.wait(10, { x: 3226, y: GE - 16, hat: true, fx: (u, t) => ({ sy: 1 + .03 * Math.sin(t * 6) }) });
+K.end = K.win + 3.2;
+ev(K.end, () => showReplay());
+
+// ====================================================================
+//  静态地图
+// ====================================================================
+const defs = $('defs'), BG = $('bg'), FG = $('fg'), PROPS = $('props'), FX = $('fx'), TALK = $('talk');
+const X0 = -80, X1 = 3600;
+function pattern(id, w, h, html) { defs.insertAdjacentHTML('beforeend', `<pattern id="${id}" width="${w}" height="${h}" patternUnits="userSpaceOnUse">${html}</pattern>`); }
+pattern('ice', 16, 16, R(0, 0, 16, 16, '#cfefff') + R(0, 0, 16, 1, '#9dd6f2') + R(0, 0, 1, 8, '#9dd6f2') + R(0, 8, 16, 1, '#9dd6f2') + R(8, 8, 1, 8, '#9dd6f2'));
+pattern('earth', 16, 16, R(0, 0, 16, 16, '#4b3a34') + R(3, 4, 3, 2, '#5c4840') + R(10, 11, 4, 2, '#3c2e29') + R(12, 2, 2, 2, '#5c4840'));
+pattern('rock', 16, 16, R(0, 0, 16, 16, '#2b2424') + R(0, 0, 16, 1, '#140f0f') + R(0, 0, 1, 8, '#140f0f') + R(0, 8, 16, 1, '#140f0f') + R(8, 8, 1, 8, '#140f0f') + R(4, 4, 2, 1, '#5a1e12'));
+pattern('brick', 16, 16, R(0, 0, 16, 16, '#c86a2c') + R(0, 0, 16, 1, '#7a3d10') + R(0, 0, 1, 8, '#7a3d10') + R(0, 8, 16, 1, '#7a3d10') + R(8, 8, 1, 8, '#7a3d10'));
+pattern('soil', 16, 16, R(0, 0, 16, 16, '#c8925a') + R(0, 0, 16, 1, '#8a5a30') + R(0, 0, 1, 8, '#8a5a30') + R(0, 8, 16, 1, '#8a5a30') + R(8, 8, 1, 8, '#8a5a30'));
+pattern('cliff', 16, 16, R(0, 0, 16, 16, '#9a5530') + R(2, 3, 5, 2, '#b0663a') + R(9, 10, 5, 2, '#7a4022') + R(0, 15, 16, 1, '#7a4022'));
+const skyStops = [[-80, '#a8d8ff'], [600, '#a8d8ff'], [820, '#c0502a'], [1300, '#8a2a16'], [1460, '#b8402a'], [1580, '#6aa0f8'], [2100, '#5c94fc'], [2300, '#2f6fe0'], [2820, '#4a86ec'], [3000, '#ff9a8b'], [3600, '#ffc8a0']];
+defs.insertAdjacentHTML('beforeend',
+  `<linearGradient id="sky" gradientUnits="userSpaceOnUse" x1="${X0}" y1="0" x2="${X1}" y2="0">${skyStops.map(([x, c]) => `<stop offset="${(x - X0) / (X1 - X0)}" stop-color="${c}"/>`).join('')}</linearGradient>
+   <linearGradient id="skyV" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0a0a30" stop-opacity=".55"/><stop offset=".45" stop-color="#0a0a30" stop-opacity="0"/><stop offset="1" stop-color="#fff" stop-opacity=".12"/></linearGradient>`);
+
+function steppedMountain(cx, base, h, col, cap, step = 6, capCol = '#fff') {
+  let s = ''; const n = Math.floor(h / step);
+  for (let i = 0; i < n; i++) {
+    const w = (n - i) * step * 2;
+    s += R(cx - w / 2, base - (i + 1) * step, w, step, cap && i >= n - cap ? capCol : col);
+  }
+  return s;
+}
+function pine(x, base, snow) {
+  let s = R(x + 5, base - 6, 4, 6, '#5a3a22');
+  [14, 10, 6].forEach((w, i) => {
+    const y = base - 12 - i * 7;
+    s += R(x + 7 - w / 2, y, w, 7, '#1f6b4a');
+    if (snow) s += R(x + 7 - w / 2, y, w, 2, '#fff');
+  });
+  return s;
+}
+const cloud = (x, y) => R(x + 4, y, 12, 4, '#fff') + R(x, y + 4, 24, 6, '#fff') + R(x + 14, y - 3, 8, 4, '#fff');
+
+let m = '';
+m += R(X0, -500, X1 - X0, 1100, 'url(#sky)') + R(X0, -500, X1 - X0, 1100, 'url(#skyV)');
+// 雪原
+m += steppedMountain(80, GA, 90, '#9bb3d6', 4) + steppedMountain(260, GA, 114, '#87a2cc', 5) + steppedMountain(470, GA, 72, '#a9bfe0', 3) + steppedMountain(700, GA, 140, '#8ea8d0', 6);
+[10, 120, 300, 470, 545].forEach(x => m += pine(x, GA, true));
+m += R(X0, GA, 800, 6, '#fff') + R(X0, GA + 6, 800, 54, 'url(#ice)') + R(X0, GA + 60, 800, 400, 'url(#earth)');
+m += R(200, GA - 16, 16, 16, '#7fdcff') + R(202, GA - 14, 4, 2, '#fff') + R(200, GA - 16, 16, 1, '#fff');
+// 火山口左壁（阶梯）
+[[720, 200], [736, 250], [752, 300], [768, 350], [784, 400]].forEach(([x, y]) => m += R(x, y, 16, 520 - y, 'url(#rock)') + R(x, y, 16, 3, '#5a1e12'));
+// 火山口
+m += steppedMountain(1250, GB, 156, '#3d2a2a', 0, 8);
+m += R(1238, GB - 156, 24, 6, '#ff5a1f', 'class="lavaGlow"');
+[[-6, 50], [5, 80], [-12, 30]].forEach(([dx, h]) => m += R(1250 + dx, GB - 150, 4, h, '#ff7a1f'));
+m += steppedMountain(900, GB, 56, '#2a1c1c', 0, 8) + steppedMountain(1400, GB, 64, '#2a1c1c', 0, 8);
+m += R(800, GB, 160, 120, 'url(#rock)') + R(1160, GB, 320, 120, 'url(#rock)') + R(800, GB, 160, 3, '#5a1e12') + R(1160, GB, 320, 3, '#5a1e12');
+m += R(960, GB + 4, 200, 116, '#ff5a1f', 'class="lava"');
+m += R(1420, GB - 1, 20, 3, '#ff7a1f') + R(1426, GB - 2, 8, 2, '#1a0d0d');
+// 火山口右壁
+[[1480, 340], [1496, 270], [1512, 200]].forEach(([x, y]) => m += R(x, y, 16 + (x === 1512 ? 18 : 0), 520 - y, 'url(#rock)') + R(x, y, 16 + (x === 1512 ? 18 : 0), 3, '#5a1e12'));
+// 草甸
+m += steppedMountain(1660, GC, 48, '#2fa84f', 0, 8) + steppedMountain(1860, GC, 32, '#3cc463', 0, 8) + steppedMountain(2040, GC, 40, '#2fa84f', 0, 8);
+[[1560, 60], [1700, 30], [1840, 70], [1980, 40], [2080, 90]].forEach(([x, y]) => m += cloud(x, y));
+[1640, 1770, 1960].forEach(x => m += R(x, GC - 8, 22, 8, '#3cc463') + R(x + 4, GC - 12, 14, 4, '#3cc463'));
+for (let i = 0; i < 30; i++) { const x = 1535 + i * 20 + (i * 7 % 9); m += R(x, GC - 3, 3, 3, ['#ff5a8a', '#fff', '#ffd23f'][i % 3]); }
+m += R(1530, GC, 620, 320, 'url(#brick)') + R(1530, GC, 620, 4, '#3cc463');
+// 高原台地
+m += R(2150, GD, 730, 480, 'url(#cliff)') + R(2150, GD, 730, 4, '#7fae4c') + R(2150, GD + 4, 2, 476, '#6a3a1c') + R(2878, GD + 4, 2, 190, '#6a3a1c');
+m += steppedMountain(2330, GD, 120, '#a6b8cc', 5, 8) + steppedMountain(2520, GD, 150, '#93a8c0', 6, 8) + steppedMountain(2720, GD, 100, '#a6b8cc', 4, 8);
+[[2200, 2290, -10], [2400, 2480, -20], [2620, 2700, -6]].forEach(([a, b, y]) => {
+  m += R(a, y, 1, GD - y, '#5a3a22') + R(b, y, 1, GD - y, '#5a3a22') + R(a, y, b - a, 1, '#5a3a22');
+  for (let x = a + 3, k = 0; x < b - 4; x += 8, k++) m += R(x, y + 1 + (k % 2), 6, 7, ['#2a6fdb', '#fff', '#e23b3b', '#3cb043', '#ffd23f'][k % 5]);
+});
+[[2240, -60], [2460, -90], [2700, -50]].forEach(([x, y]) => m += cloud(x, y));
+// 索道
+m += R(2799, -16, 3, GD + 16, '#5a3a22') + R(3172, ROPE.y1 - 2, 3, GE - ROPE.y1 + 2, '#5a3a22');
+m += `<line x1="${ROPE.x0}" y1="${ROPE.y0}" x2="${ROPE.x1}" y2="${ROPE.y1}" stroke="#3a2a1a" stroke-width="1" shape-rendering="auto"/>`;
+for (let x = ROPE.x0 + 6, k = 0; x < ROPE.x1 - 6; x += 9, k++) m += R(x, ropeY(x) + 1, 5, 6, ['#2a6fdb', '#fff', '#e23b3b', '#3cb043', '#ffd23f'][k % 5], 'opacity=".9"');
+// 终点
+m += R(3380, 60, 22, 22, '#fff3b0') + R(3376, 64, 30, 14, '#fff3b0');
+[3060, 3330, 3460].forEach(x => m += R(x + 10, GE - 30, 6, 30, '#6b3f22') + R(x, GE - 52, 26, 24, '#ffb7d0') + R(x + 4, GE - 58, 18, 6, '#ffc9dc'));
+for (let i = 0; i < 34; i++) { const x = 2885 + i * 18 + (i * 5 % 7); m += R(x, GE - 3, 3, 3, ['#ff5a8a', '#fff', '#ffd23f', '#ff9aa8'][i % 4]); }
+m += R(2880, GE, 720, 300, 'url(#brick)') + R(2880, GE, 720, 4, '#57c76a');
+// 地下管道剖面
+m += R(622, GA, 20, 244, '#14141c') + R(622, 420, 270, 24, '#14141c') + R(870, GB, 20, 44, '#14141c');
+m += R(620, GA, 2, 220, '#2fb84a') + R(642, GA, 2, 218, '#2fb84a') + R(642, 418, 228, 2, '#2fb84a') + R(620, 444, 272, 2, '#2fb84a') + R(868, GB, 2, 20, '#2fb84a') + R(890, GB, 2, 46, '#2fb84a');
+for (let x = 650; x < 860; x += 24) m += R(x, 428, 6, 2, '#2a2a3a');
+BG.innerHTML = m;
+
+// 前景：管口、岩浆表面（会挡住角色）
+function pipeTop(x, top) { return R(x, top + 6, 24, 18, '#2fb84a') + R(x + 3, top + 6, 4, 18, '#8af0a0') + R(x - 3, top, 30, 7, '#3cd85a') + R(x - 3, top, 30, 1, '#145a24') + R(x, top + 2, 4, 3, '#8af0a0'); }
+FG.innerHTML = pipeTop(620, 176) + pipeTop(868, 376) + R(960, GB + 4, 200, 8, '#ff5a1f', 'class="lava"') + R(960, GB + 3, 200, 1, '#ffd23f', 'opacity=".8"');
+const occluder = g(R(1866, GC, 28, 14, 'url(#brick)') + R(1866, GC, 28, 4, '#3cc463'), FG);
+
+// ====================================================================
+//  道具 / 地图互动
+// ====================================================================
+const P = [];
+const prop = (html, update, parent = PROPS) => { const e = g(html, parent); P.push(t => update(e, t)); return e; };
+const show = (e, v) => e.setAttribute('display', v ? 'inline' : 'none');
+const tr = (e, s) => e.setAttribute('transform', s);
+
+// 雪球
+prop(`<circle r="4" fill="#fff" stroke="#9dd6f2" stroke-width=".7" shape-rendering="auto"/>`, (e, t) => {
+  const t0 = K.throwSnow, t1 = K.snowHit;
+  show(e, t >= t0 && t < t1);
+  if (t < t0 || t >= t1) return;
+  const u = (t - t0) / (t1 - t0), x0 = 352, y0 = GA - 16, x1 = 264, y1 = GA - 16;
+  tr(e, `translate(${lerp(x0, x1, u)},${lerp(y0, y1, u) - 22 * Math.sin(u * Math.PI)})`);
+});
+// 雪人
+prop(R(384, GA - 10, 14, 10, '#fff') + R(386, GA - 18, 10, 8, '#fff') + R(388, GA - 16, 2, 2, '#222') + R(392, GA - 14, 4, 2, '#ff8a1f') + R(385, GA - 21, 12, 3, '#d6245c'),
+  (e, t) => show(e, t < K.snowman));
+// 火山口踏石
+STONES.forEach((sx, i) => prop(R(sx - 8, GB - 2, 16, 10, '#4a3a3a') + R(sx - 8, GB - 2, 16, 2, '#6a5a5a'), (e, t) => {
+  let dy = 0, dx = 0;
+  if (i === 1) {
+    if (t > K.stoneTap && t < K.stoneTap + 0.3) dx = Math.sin(t * 80);
+    dy = clamp((t - K.sink) / 0.5, 0, 1) * 12 + clamp((t - K.fire) / 0.6, 0, 1) * 10;
+  }
+  tr(e, `translate(${dx},${dy})`);
+}));
+// 石头
+const BOULDER_SVG = (() => { let s = ''; for (let y = -9; y < 9; y++) { const hw = Math.floor(Math.sqrt(81 - (y + .5) ** 2)); s += R(-hw, y, hw * 2, 1, '#6a6a6a'); } return s + R(-4, -6, 4, 3, '#9a9a9a') + R(2, 1, 5, 1, '#3a3a3a') + R(-6, 3, 4, 1, '#3a3a3a') + R(1, -3, 1, 6, '#3a3a3a'); })();
+prop(BOULDER_SVG, (e, t) => {
+  let x = BOULDER.x, y = GB - BOULDER.r, rot = 0;
+  if (t > K.kick) { x = BOULDER.x - BOULDER.v * (t - K.kick); rot = -(BOULDER.x - x) / BOULDER.r * 57.3; }
+  if (x < 1168) { y += (1168 - x) * 0.5; }
+  show(e, y < GB + 14);
+  tr(e, `translate(${x},${y}) rotate(${rot})`);
+});
+// 喷发
+prop(`<g class="col"></g>`, (e, t) => {
+  const erupt = (T0, dur, H) => { if (t < T0 || t > T0 + dur) return 0; const u = (t - T0) / dur; return H * Math.sin(Math.min(1, u * 3) * Math.PI / 2) * (u > .7 ? (1 - u) / .3 : 1); };
+  const h = Math.max(erupt(K.E1, 1.0, 110), erupt(K.E2, 1.5, 320));
+  if (h < 1) { e.innerHTML = ''; return; }
+  let s = '';
+  for (let y = 0; y < h; y += 6) {
+    const w = 10 + 6 * Math.sin(t * 30 + y * 0.3);
+    s += R(1430 - w / 2, GB - y - 6, w, 6, (Math.floor(y / 6 + t * 20) % 3) ? '#ff7a1f' : '#ffd23f');
+  }
+  e.innerHTML = s;
+});
+// 问号砖 A（被她从天而降砸中）
+const qBlock = (x, y) => R(x, y, 16, 16, '#e0a030') + R(x, y, 16, 1, '#ffd890') + R(x + 6, y + 3, 4, 6, '#7a3d10') + R(x + 6, y + 11, 4, 2, '#7a3d10');
+const usedBlock = (x, y) => R(x, y, 16, 16, '#8a5a30') + R(x + 1, y + 1, 2, 2, '#5a3a20') + R(x + 13, y + 1, 2, 2, '#5a3a20') + R(x + 1, y + 13, 2, 2, '#5a3a20') + R(x + 13, y + 13, 2, 2, '#5a3a20');
+prop(`<g class="q">${qBlock(1592, 114)}</g><g class="u">${usedBlock(1592, 114)}</g>`, (e, t) => {
+  show(e.querySelector('.q'), t < K.blockA); show(e.querySelector('.u'), t >= K.blockA);
+  const d = t > K.blockA && t < K.blockA + 0.2 ? 4 * Math.sin((t - K.blockA) / 0.2 * Math.PI) : 0;
+  tr(e, `translate(0,${d})`);
+});
+// 香蕉皮
+const BANANA = R(-4, -3, 2, 2, '#ffd23f') + R(-3, -2, 6, 2, '#ffd23f') + R(2, -4, 2, 2, '#ffd23f') + R(-4, -1, 8, 1, '#c8a020') + R(3, -5, 1, 1, '#5a3a20');
+[K.ban1, K.ban2].forEach((b, i) => prop(BANANA, (e, t) => {
+  if (t < b.t0) { show(e, false); return; }
+  show(e, true);
+  const bx = 1756;
+  if (t < b.t1) { const u = (t - b.t0) / (b.t1 - b.t0); tr(e, `translate(${lerp(bx, b.x, u)},${lerp(GC - 16, GC, u) - 30 * Math.sin(u * Math.PI)}) rotate(${u * 720})`); return; }
+  if (i === 0 && t > K.slip) { const u = (t - K.slip) / 0.7; tr(e, `translate(${b.x - 60 * u},${GC - 60 * Math.sin(Math.min(u, 1) * Math.PI) + 40 * Math.max(0, u - 1)}) rotate(${-900 * u})`); return; }
+  tr(e, `translate(${b.x},${GC})`);
+}));
+// 弹簧
+prop(`<g class="s">${R(-7, -2, 14, 2, '#e23b3b')}${R(-5, -10, 10, 2, '#bbb')}${R(-5, -6, 10, 2, '#888')}${R(-7, -12, 14, 2, '#e23b3b')}</g>`, (e, t) => {
+  let sy = 1;
+  if (t > K.spring && t < K.spring + 0.5) { const u = (t - K.spring) / 0.5; sy = 1 - 0.5 * Math.exp(-4 * u) * Math.cos(4 * Math.PI * u); }
+  tr(e, `translate(1790,${GC}) scale(1,${sy})`);
+});
+// 问号砖 B + 藤蔓
+prop(`<g class="v"></g><g class="q">${qBlock(2102, 120)}</g><g class="u">${usedBlock(2102, 120)}</g>`, (e, t) => {
+  show(e.querySelector('.q'), t < K.vine); show(e.querySelector('.u'), t >= K.vine);
+  const h = clamp((t - K.vine) / 1.0, 0, 1) * 104;
+  const wig = t > K.shake - 0.1 && t < K.shake + 0.7 ? 4 * Math.sin(t * 40) : 0;
+  let s = '';
+  for (let y = 0; y < h; y += 4) {
+    const k = y / 104, off = wig * k;
+    s += R(2109 + off, 120 - y - 4, 2, 4, '#2f9a3a');
+    if ((y / 4) % 3 === 1) s += R(2111 + off, 120 - y - 4, 4, 3, '#4fd060');
+    if ((y / 4) % 3 === 2) s += R(2105 + off, 120 - y - 4, 4, 3, '#4fd060');
+  }
+  e.querySelector('.v').innerHTML = s;
+  const d = t > K.vine && t < K.vine + 0.2 ? -4 * Math.sin((t - K.vine) / 0.2 * Math.PI) : 0;
+  tr(e.querySelector('.q'), `translate(0,${d})`); tr(e.querySelector('.u'), `translate(0,${d})`);
+});
+// 头插地遮挡
+P.push(t => show(occluder, t >= K.stuckHead && t < K.unstuck));
+// 大风
+prop('', (e, t) => {
+  const on = t > K.wind - 0.3 && t < K.wind + 1.3;
+  if (!on) { e.innerHTML = ''; return; }
+  let s = '';
+  for (let i = 0; i < 14; i++) {
+    const x = 2460 - ((t * 420 + i * 53) % 260), y = GD - 30 + (i * 37 % 34);
+    s += R(x, y, 18 + (i % 3) * 6, 1, '#ffffff', 'opacity=".75"');
+  }
+  e.innerHTML = s;
+}, FX);
+// 牦牛
+function yakSVG(ph) {
+  let s = R(0, 4, 22, 10, '#4a3326') + R(2, 2, 16, 3, '#5a4030');
+  for (let x = 0; x < 22; x += 3) s += R(x, 14, 2, 2 + (x % 2), '#3a2618');
+  s += R(18, 3, 10, 9, '#3a281e') + R(26, 7, 3, 4, '#2a1c14') + R(23, 5, 2, 2, '#fff') + R(24, 6, 1, 1, '#000');
+  s += R(19, 0, 2, 3, '#f0e8d8') + R(25, 0, 2, 3, '#f0e8d8') + R(18, 0, 2, 1, '#f0e8d8') + R(26, 0, 2, 1, '#f0e8d8');
+  s += R(-2, 5, 3, 6, '#3a2618');
+  const lg = ph ? [[2, 0], [6, 2], [14, 2], [18, 0]] : [[2, 2], [6, 0], [14, 0], [18, 2]];
+  for (const [x, d] of lg) s += R(x, 16, 3, 4 - d, '#2a1c14');
+  return s;
+}
+const yak = prop(`<g class="a">${yakSVG(0)}</g><g class="b">${yakSVG(1)}</g><g class="st"></g>`, (e, t) => {
+  let x = 2600, hop = 0, gallop = false, lean = 0;
+  if (t > yakT.bonk && t < yakT.go) hop = -6 * Math.sin((t - yakT.bonk) / (yakT.go - yakT.bonk) * Math.PI);
+  if (t >= yakT.go && t < yakT.stop) { x = 2600 + 190 * (t - yakT.go) / (yakT.stop - yakT.go); gallop = true; hop = -2 * Math.abs(Math.sin(t * 22)); }
+  if (t >= yakT.stop) { x = 2790; lean = t < yakT.stop + 0.3 ? -12 : 0; }
+  const ph = gallop ? Math.floor(t / 0.08) % 2 : 0;
+  show(e.querySelector('.a'), !ph); show(e.querySelector('.b'), !!ph);
+  tr(e, `translate(${x - 14},${GD - 20 + hop}) rotate(${lean},14,20)`);
+  e.querySelector('.st').innerHTML = (t > yakT.bonk && t < yakT.stop + 1.2) ? R(30, 6 - ((t * 20) % 6), 3, 2, '#fff', 'opacity=".8"') + R(30, 10 - ((t * 24) % 8), 2, 2, '#fff', 'opacity=".6"') : '';
+});
+// 打成一团的烟雾
+prop('', (e, t) => {
+  if (t < K.crash || t > K.cloudEnd) { e.innerHTML = ''; return; }
+  const cx = 3190 + 34 * (t - K.crash) / 1.6, cy = GE - 14;
+  let s = '';
+  for (let i = 0; i < 9; i++) {
+    const a = i * 0.7 + t * 9, r = 9 + 3 * Math.sin(t * 20 + i);
+    s += `<circle cx="${cx + Math.cos(a) * 10}" cy="${cy + Math.sin(a) * 6}" r="${r}" fill="${i % 2 ? '#fff' : '#e8e4f0'}" shape-rendering="auto"/>`;
+  }
+  const bits = [['#f29ab8', 4, 2], ['#141014', 4, 2], ['#ffe0cc', 3, 2], ['#e4b440', 3, 3], ['#6b3e26', 4, 3]];
+  bits.forEach(([c, w, h], i) => { const a = t * 13 + i * 1.3; s += R(cx + Math.cos(a) * 16, cy + Math.sin(a * 1.3) * 10, w, h, c); });
+  for (let i = 0; i < 3; i++) { const a = t * 7 + i * 2.1; s += R(cx + Math.cos(a) * 20, cy - 10 + Math.sin(a) * 6, 3, 3, '#ffd23f'); }
+  e.innerHTML = s;
+}, FX);
+// 飞到她头上的官帽
+prop(rowsToSVG(HAT), (e, t) => {
+  const t0 = K.cloudEnd, t1 = K.hatLand;
+  show(e, t >= t0 && t < t1);
+  if (t < t0 || t >= t1) return;
+  const u = (t - t0) / (t1 - t0);
+  tr(e, `translate(${lerp(3224, 3218, u)},${lerp(GE - 24, GE - 43, u) - 50 * Math.sin(u * Math.PI)}) rotate(${720 * u},8,4)`);
+}, FX);
+// 爱心
+const HEART = [".rr.rr.", "rpprrrr", "rpwrrrr", "rrrrrrr", ".rrrrr.", "..rrr..", "...r..."];
+const heartRows = HEART.map(r => r.replace(/p/g, 'c'));
+prop(rowsToSVG(heartRows), (e, t) => {
+  show(e, t > K.heart);
+  const u = clamp((t - K.heart) / 0.6, 0, 1);
+  const s = 2 * (u < 1 ? (1 + 0.4 * Math.sin(u * Math.PI)) * u : 1 + 0.08 * Math.sin(t * 8));
+  tr(e, `translate(3228,${GE - 64 - 10 * u}) scale(${s}) translate(-3.5,-3.5)`);
+}, FX);
+
+// 背景小动画：雪花、火星、花瓣
+const ambient = g('', BG);
+const flakes = Array.from({ length: 50 }, (_, i) => ({ x: -60 + (i * 97) % 800, y0: (i * 53) % 300, v: 20 + (i % 5) * 6, d: (i % 7) - 3 }));
+const embers = Array.from({ length: 30 }, (_, i) => ({ x: 820 + (i * 131) % 660, v: 25 + (i % 4) * 10, ph: i * 0.37 }));
+const petals = Array.from({ length: 26 }, (_, i) => ({ x: 2900 + (i * 89) % 640, v: 14 + (i % 4) * 5, ph: i * 0.41 }));
+function ambientUpdate(t) {
+  let s = '';
+  for (const f of flakes) s += R(f.x + Math.sin(t + f.d) * 6, -40 + (f.y0 + t * f.v) % 300, 2, 2, '#fff');
+  for (const e of embers) { const k = (t * e.v / 200 + e.ph) % 1; s += R(e.x + Math.sin(t * 2 + e.ph * 9) * 5, GB - k * 200, 2, 2, k < .7 ? '#ffb02e' : '#ff5a1f', `opacity="${1 - k}"`); }
+  for (const p of petals) { const k = (t * p.v / 260 + p.ph) % 1; s += R(p.x + Math.sin(t * 1.5 + p.ph * 7) * 14 - k * 40, GE - 260 + k * 260, 3, 2, '#ffb7d0'); }
+  ambient.innerHTML = s;
+}
+
+// ====================================================================
+//  角色绘制
+// ====================================================================
+class Actor {
+  constructor(act, poses, extra = '') {
+    this.act = act;
+    this.root = el('g', {}, $('actors'));
+    this.fire = el('g', {}, this.root);
+    this.body = el('g', {}, this.root);
+    this.pose = {};
+    for (const k in poses) { this.pose[k] = g(rowsToSVG(poses[k]), this.body); }
+    this.hat = g(rowsToSVG(HAT), this.body, { transform: 'translate(-1,-5)' });
+    this.pulley = g(R(-3, -32, 6, 3, '#3a2a1a') + R(-1, -30, 2, 5, '#ffe0cc'), this.root);
+    this.ball = g(snowballSVG(), this.root);
+    this.deco = el('g', {}, this.root);
+  }
+  render(t) {
+    const s = this.act.at(t);
+    this.state = s;
+    const { x, y } = s, flip = s.flip || 1, sx = s.sx ?? 1, sy = s.sy ?? 1, rot = s.rot || 0;
+    show(this.root, !s.hidden);
+    if (s.hidden) return s;
+    const cur = s.pose || 'stand';
+    for (const k in this.pose) show(this.pose[k], !s.ball && k === cur);
+    show(this.hat, !!s.hat && !s.ball);
+    show(this.ball, !!s.ball);
+    show(this.pulley, !!s.hang);
+    tr(this.root, `translate(${x},${y})`);
+    if (s.ball) { tr(this.ball, `translate(0,${-s.r}) rotate(${rot}) scale(${s.r / 13 * sx},${s.r / 13})`); }
+    tr(this.body, `translate(0,-12) rotate(${rot}) translate(0,12) scale(${flip * sx},${sy}) translate(-8,-24)`);
+    // 屁股着火
+    if (s.fire) {
+      let f = '';
+      for (let i = 0; i < 5; i++) {
+        const h = 5 + ((t * 40 + i * 3) % 7);
+        f += R(-flip * (4 + i) - 1, -6 - h, 2, h, i % 2 ? '#ffd23f' : '#ff5a1f');
+      }
+      this.fire.innerHTML = f;
+      tr(this.fire, `translate(0,-12) rotate(${rot}) translate(0,12)`);
+    } else this.fire.innerHTML = '';
+    // 头顶装饰：转圈星星、汗、惊叹号
+    let d = '';
+    if (s.dizzy) for (let i = 0; i < 3; i++) { const a = t * 7 + i * 2.1; d += R(Math.cos(a) * 9 - 1, -30 + Math.sin(a) * 3 + (rot ? 14 : 0), 3, 3, '#ffd23f'); }
+    if (s.sweat) d += R(8, -26 + ((t * 30) % 6), 2, 3, '#7fd0ff');
+    if (s.surprised) d += R(-1, -38, 3, 8, '#ffd23f', 'stroke="#1a1020" stroke-width=".5"') + R(-1, -28, 3, 3, '#ffd23f', 'stroke="#1a1020" stroke-width=".5"');
+    this.deco.innerHTML = d;
+    return s;
+  }
+}
+const girl = new Actor(G, GIRL);
+const boy = new Actor(B, BOY);
+
+// ====================================================================
+//  粒子特效
+// ====================================================================
+let parts = [];
+function spawn(x, y, vx, vy, c, size = 2, life = 0.6, grav = 300) {
+  const e = el('rect', { width: size, height: size, fill: c }, FX);
+  parts.push({ e, x, y, vx, vy, life, max: life, grav });
+}
+function puff(x, y, n = 4, c = '#f4f0e8') { for (let i = 0; i < n; i++) spawn(x + (i % 2 ? 6 : -8), y - 3, (i % 2 ? 1 : -1) * (20 + i * 8), -10 - i * 4, c, 3, 0.35, 0); }
+function burst(x, y, n, cols) { for (let i = 0; i < n; i++) { const a = (i / n) * Math.PI * 2 + i; spawn(x, y, Math.cos(a) * (40 + (i * 13) % 50), Math.sin(a) * (40 + (i * 7) % 40) - 50, cols[i % cols.length], 2 + (i % 3), 0.8, 260); } }
+function stars(x, y) { for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; spawn(x, y, Math.cos(a) * 60, Math.sin(a) * 60, '#ffd23f', 3, 0.45, 0); } }
+function smoke(x, y, n) { for (let i = 0; i < n; i++) spawn(x - 6 + i * 2, y, (i % 3 - 1) * 8, -30 - i * 3, '#9a9a9a', 3, 0.9, -10); }
+function coin(x, y) { spawn(x - 2, y, 0, -160, '#ffd23f', 5, 0.6, 400); }
+let shakeAmp = 0;
+const shake = a => { shakeAmp = Math.max(shakeAmp, a); };
+function updateParts(dt, t) {
+  for (const a of [girl, boy]) {
+    const s = a.state;
+    if (!s || s.hidden) continue;
+    if (s.dash && Math.random() < 0.6) spawn(s.x - (s.flip || 1) * 8, s.y - 2 - Math.random() * 3, -(s.flip || 1) * 20, -8, s.fire ? '#ff7a1f' : '#e8e0d0', 3, 0.3, 0);
+    if (s.fire && Math.random() < 0.5) spawn(s.x - (s.flip || 1) * 6, s.y - 10, 0, -40, '#7a7a7a', 2, 0.5, -20);
+    if (s.angry && Math.random() < 0.15) spawn(s.x + (Math.random() < .5 ? -6 : 6), s.y - 26, 0, -30, '#ffffff', 3, 0.4, 0);
+  }
+  parts = parts.filter(p => {
+    p.life -= dt;
+    if (p.life <= 0) { p.e.remove(); return false; }
+    p.vy += p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    p.e.setAttribute('x', p.x.toFixed(1)); p.e.setAttribute('y', p.y.toFixed(1));
+    p.e.setAttribute('opacity', (p.life / p.max).toFixed(2));
+    return true;
+  });
+}
+
+// ====================================================================
+//  对白气泡
+// ====================================================================
+const bubbles = SAYS.map(s => {
+  const w = s.text.length * 8 + 10;
+  const e = g(`<rect x="${-w / 2}" y="-14" width="${w}" height="14" fill="#fff" stroke="#1a1020"/>` +
+    `<rect x="-2" y="0" width="4" height="3" fill="#fff"/>` +
+    `<text x="0" y="-3.8" font-size="8" text-anchor="middle" fill="#1a1020" font-weight="bold" font-family="'PingFang SC','Hiragino Sans GB',sans-serif">${s.text}</text>`, TALK);
+  return { s, e };
+});
+function updateBubbles(t, cam) {
+  for (const { s, e } of bubbles) {
+    const on = t >= s.t0 && t < s.t1;
+    show(e, on);
+    if (!on) continue;
+    const st = (s.who === G ? girl : boy).state;
+    const u = clamp((t - s.t0) / 0.12, 0, 1);
+    let x = clamp(st.x + s.dx, cam.x + 40, cam.x + 280), y = clamp(st.y - 32 + s.dy, cam.y + 34, cam.y + 170);
+    tr(e, `translate(${x},${y}) scale(${0.6 + 0.4 * u})`);
+  }
+}
+
+// ====================================================================
+//  HUD
+// ====================================================================
+const hud = $('hud');
+hud.innerHTML = R(0, 0, 320, 16, '#000', 'opacity=".35"') +
+  `<text id="zone" x="8" y="11.5" font-size="8" fill="#ffd23f" font-weight="bold" font-family="'PingFang SC',sans-serif"></text>` +
+  `<text x="190" y="11.5" font-size="8" fill="#fff" font-weight="bold" font-family="'PingFang SC',sans-serif">差距</text>` +
+  R(212, 5, 100, 6, '#3a2a40') + `<rect id="gap" x="212" y="5" height="6" width="0" fill="#ff5a8a"/>`;
+const ZONES = [['1-1', '冰天雪地'], ['1-2', '地下管道'], ['1-3', '火山口'], ['1-4', '草甸'], ['1-5', '高原'], ['1-6', '终点']];
+function zoneOf(s) {
+  if (s.y > 410 && s.x < 900) return 1;
+  if (s.x < 640 && s.y < 300) return 0;
+  if (s.x < 640) return 1;
+  if (s.x < 1520) return 2;
+  if (s.x < 2160) return 3;
+  if (s.x < 2880) return 4;
+  return 5;
+}
+let curZone = -1, bannerTimer = 0;
+let won = false;
+function showWin() {
+  won = true;
+  clearTimeout(bannerTimer);
+  const b = $('banner');
+  b.innerHTML = '<small>STAGE CLEAR</small>终于追到你啦！';
+  b.style.color = '#ff7eb6';
+  b.classList.add('show');
+}
+function setZone(z) {
+  if (z === curZone || won) return;
+  curZone = z;
+  $('zone').textContent = `WORLD ${ZONES[z][0]}  ${ZONES[z][1]}`;
+  const b = $('banner');
+  b.innerHTML = `<small>WORLD ${ZONES[z][0]}</small>${ZONES[z][1]}`;
+  b.classList.add('show');
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => b.classList.remove('show'), 1400);
+  SFX.stage();
+}
+
+// ====================================================================
+//  8-bit 音效
+// ====================================================================
+let AC, master;
+function initAudio() {
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  master = AC.createGain(); master.gain.value = 0.55; master.connect(AC.destination);
+}
+const now = () => AC.currentTime;
+function tone({ type = 'square', f0, f1 = f0, dur, vol = 0.12, vib = 0, vibRate = 16, at = now(), lin = false }) {
+  const o = AC.createOscillator(), gn = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, at);
+  if (f1 !== f0) lin ? o.frequency.linearRampToValueAtTime(f1, at + dur) : o.frequency.exponentialRampToValueAtTime(f1, at + dur);
+  if (vib) { const l = AC.createOscillator(), lg = AC.createGain(); l.frequency.value = vibRate; lg.gain.value = vib; l.connect(lg).connect(o.frequency); l.start(at); l.stop(at + dur); }
+  gn.gain.setValueAtTime(vol, at); gn.gain.exponentialRampToValueAtTime(0.0008, at + dur);
+  o.connect(gn).connect(master); o.start(at); o.stop(at + dur + 0.02);
+}
+let noiseBuf;
+function noise({ dur, vol = 0.15, freq = 800, type = 'lowpass', at = now(), f1 }) {
+  if (!noiseBuf) { noiseBuf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate); const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; }
+  const s = AC.createBufferSource(), fl = AC.createBiquadFilter(), gn = AC.createGain();
+  s.buffer = noiseBuf; s.loop = true; fl.type = type; fl.frequency.setValueAtTime(freq, at);
+  if (f1) fl.frequency.exponentialRampToValueAtTime(f1, at + dur);
+  gn.gain.setValueAtTime(vol, at); gn.gain.exponentialRampToValueAtTime(0.0008, at + dur);
+  s.connect(fl).connect(gn).connect(master); s.start(at); s.stop(at + dur + 0.02);
+}
+const N = n => 440 * Math.pow(2, (n - 69) / 12);
+const SFX = new Proxy({
+  girlJump: () => tone({ f0: 380, f1: 1150, dur: 0.18, vol: 0.1 }),
+  boyJump: () => tone({ f0: 200, f1: 560, dur: 0.2, vol: 0.1 }),
+  hop: () => tone({ f0: 500, f1: 900, dur: 0.08, vol: 0.06 }),
+  boing: () => tone({ type: 'triangle', f0: 260, f1: 900, dur: 0.55, vol: 0.22, vib: 70, vibRate: 14 }),
+  spring: () => tone({ type: 'triangle', f0: 120, f1: 1400, dur: 0.7, vol: 0.25, vib: 90, vibRate: 18 }),
+  land: () => { noise({ dur: 0.08, vol: 0.2, freq: 700 }); tone({ f0: 140, f1: 55, dur: 0.09, vol: 0.1 }); },
+  bonk: () => { tone({ f0: 320, f1: 90, dur: 0.14, vol: 0.18 }); noise({ dur: 0.05, vol: 0.25, freq: 2000 }); },
+  thud: () => { tone({ type: 'sine', f0: 140, f1: 40, dur: 0.3, vol: 0.5 }); noise({ dur: 0.18, vol: 0.3, freq: 400 }); },
+  splat: () => { noise({ dur: 0.18, vol: 0.3, freq: 1200, f1: 200 }); tone({ type: 'sawtooth', f0: 300, f1: 70, dur: 0.16, vol: 0.08 }); },
+  crash: () => { noise({ dur: 0.35, vol: 0.35, freq: 2500, f1: 300 }); [0, .05, .1].forEach(d => tone({ f0: 600 - d * 2000, f1: 200, dur: 0.1, vol: 0.06, at: now() + d })); },
+  slip: () => { tone({ type: 'sine', f0: 500, f1: 2000, dur: 0.22, vol: 0.18 }); tone({ type: 'sine', f0: 2000, f1: 180, dur: 0.45, vol: 0.18, at: now() + 0.22 }); },
+  pop: () => tone({ type: 'sine', f0: 400, f1: 1300, dur: 0.09, vol: 0.2 }),
+  squeak: () => { tone({ f0: 900, f1: 1500, dur: 0.07, vol: 0.08 }); tone({ f0: 1500, f1: 900, dur: 0.07, vol: 0.08, at: now() + 0.07 }); },
+  scream: () => { tone({ type: 'sawtooth', f0: 600, f1: 1500, dur: 0.7, vol: 0.09, vib: 60, vibRate: 22 }); noise({ dur: 0.7, vol: 0.12, freq: 3000, type: 'highpass' }); },
+  fizz: () => noise({ dur: 0.55, vol: 0.14, freq: 2600, type: 'highpass' }),
+  crack: () => { noise({ dur: 0.06, vol: 0.25, freq: 3000 }); noise({ dur: 0.05, vol: 0.2, freq: 1500, at: now() + 0.07 }); },
+  rumble: () => { noise({ dur: 1.2, vol: 0.3, freq: 180 }); tone({ type: 'sine', f0: 55, f1: 45, dur: 1.2, vol: 0.2 }); },
+  erupt: () => { noise({ dur: 1.4, vol: 0.4, freq: 150, f1: 1200 }); tone({ type: 'sawtooth', f0: 60, f1: 500, dur: 1.2, vol: 0.08 }); },
+  kick: () => { tone({ f0: 200, f1: 60, dur: 0.12, vol: 0.2 }); noise({ dur: 0.08, vol: 0.2, freq: 900 }); },
+  throw: () => noise({ dur: 0.2, vol: 0.18, freq: 800, f1: 4000, type: 'bandpass' }),
+  whoosh: () => noise({ dur: 0.9, vol: 0.2, freq: 400, f1: 3000, type: 'bandpass' }),
+  coin: () => { tone({ f0: N(84), dur: 0.08, vol: 0.08 }); tone({ f0: N(91), dur: 0.35, vol: 0.08, at: now() + 0.08 }); },
+  pipe: () => [0, 1, 2].forEach(i => tone({ f0: 520 - i * 110, f1: 300 - i * 70, dur: 0.1, vol: 0.12, at: now() + i * 0.11 })),
+  vine: () => [60, 64, 67, 72, 76, 79, 84, 88].forEach((n, i) => tone({ type: 'triangle', f0: N(n), dur: 0.12, vol: 0.12, at: now() + 0.1 + i * 0.09 })),
+  shakeVine: () => { for (let i = 0; i < 6; i++) noise({ dur: 0.06, vol: 0.15, freq: 1800, type: 'bandpass', at: now() + i * 0.09 }); },
+  moo: () => { tone({ type: 'sawtooth', f0: 150, f1: 110, dur: 0.8, vol: 0.14, vib: 8, vibRate: 6 }); },
+  skid: () => noise({ dur: 0.35, vol: 0.2, freq: 1500, f1: 500, type: 'bandpass' }),
+  wind: () => noise({ dur: 1.6, vol: 0.25, freq: 500, f1: 1400, type: 'bandpass' }),
+  zip: d => { noise({ dur: d, vol: 0.12, freq: 2000, f1: 5000, type: 'highpass' }); tone({ type: 'sawtooth', f0: 200, f1: 700, dur: d, vol: 0.03, lin: true }); },
+  stomp: () => { tone({ type: 'sine', f0: 110, f1: 50, dur: 0.15, vol: 0.35 }); },
+  laugh: () => [0, 1, 2, 3].forEach(i => tone({ f0: 420 - i * 30, f1: 360 - i * 30, dur: 0.08, vol: 0.08, at: now() + i * 0.12 })),
+  surprise: () => tone({ type: 'triangle', f0: 300, f1: 1400, dur: 0.25, vol: 0.2 }),
+  fight: d => { for (let i = 0; i < d / 0.08; i++) { const a = now() + i * 0.08; (i % 3 ? noise({ dur: 0.06, vol: 0.18, freq: 600 + (i * 397) % 2000, type: 'bandpass', at: a }) : tone({ f0: 200 + (i * 211) % 900, dur: 0.05, vol: 0.06, at: a })); } },
+  talk: (n, who) => { const [lo, hi] = who === 'girl' ? [620, 980] : [230, 420]; for (let i = 0; i < n * 2; i++) { const f = lo + Math.random() * (hi - lo); tone({ f0: f, f1: f * (Math.random() < .5 ? 1.25 : .8), dur: 0.06, vol: 0.06, at: now() + i * 0.07 }); } },
+  stage: () => [72, 76, 79, 84].forEach((n, i) => tone({ f0: N(n), dur: 0.1, vol: 0.07, at: now() + i * 0.07 })),
+  heart: () => { [0, 0.22].forEach(d => tone({ type: 'sine', f0: 90, f1: 50, dur: 0.14, vol: 0.4, at: now() + d })); tone({ type: 'sine', f0: 1568, dur: 0.35, vol: 0.12, at: now() + 0.5 }); tone({ type: 'sine', f0: 2093, dur: 0.5, vol: 0.12, at: now() + 0.62 }); },
+  win: () => {
+    const mel = [[72, 0], [76, .12], [79, .24], [84, .36], [79, .6], [84, .72], [88, .9]];
+    mel.forEach(([n, d], i) => tone({ f0: N(n), dur: i === mel.length - 1 ? 0.8 : 0.14, vol: 0.09, at: now() + d }));
+    [48, 55, 60].forEach((n, i) => tone({ type: 'triangle', f0: N(n), dur: 0.4, vol: 0.18, at: now() + i * .3 }));
+  },
+}, { get: (o, k) => (...a) => { if (AC && o[k]) o[k](...a); } });
+
+// 背景音乐（原创小调），追到时停
+const BPM = 168, E8 = 60 / BPM / 2;
+const MEL = [72,76,79,76,81,79,76,74, 72,76,79,84,83,79,76,79, 77,81,84,81,79,76,72,76, 74,77,81,79,77,74,71,74];
+const BASS = [48,43,48,43, 48,43,52,43, 41,48,41,48, 43,50,43,47];
+let musicIdx = 0;
+function pumpMusic(t, acNow) {
+  while (true) {
+    const nt = musicIdx * E8;
+    if (nt > K.crash - 0.1 || nt > t + 0.25) break;
+    if (nt >= t - 0.02) {
+      const at = acNow + (nt - t);
+      tone({ f0: N(MEL[musicIdx % MEL.length]), dur: E8 * 0.85, vol: 0.03, at });
+      if (musicIdx % 2 === 0) tone({ type: 'triangle', f0: N(BASS[(musicIdx / 2) % BASS.length]), dur: E8 * 1.8, vol: 0.11, at });
+      if (musicIdx % 4 === 2) noise({ dur: 0.04, vol: 0.04, freq: 6000, type: 'highpass', at });
+    }
+    musicIdx++;
+  }
+}
+
+// ====================================================================
+//  主循环
+// ====================================================================
+EVENTS.sort((a, b) => a.t - b.t);
+const world = $('world');
+let t0 = 0, last = 0, evIdx = 0, running = false;
+const cam = { x: 0, y: 0 };
+function camTarget(gs, bs) {
+  const gx = gs.hidden ? bs.x : gs.x;
+  const lead = clamp((bs.x - gx) * 0.45, -40, 90);
+  return { x: clamp(gx + lead - 150, X0 + 10, X1 - 330), y: gs.y - 128 };
+}
+function frame() {
+  if (!running) return;
+  const acNow = now();
+  const t = Math.min(acNow - t0, K.end + 0.5);
+  const dt = Math.min(0.05, Math.max(0, t - last));
+  while (evIdx < EVENTS.length && EVENTS[evIdx].t <= t) { EVENTS[evIdx].fn(); evIdx++; }
+  pumpMusic(t, acNow);
+  for (const f of P) f(t);
+  ambientUpdate(t);
+  const gs = girl.render(t), bs = boy.render(t);
+  const tg = camTarget(gs, bs);
+  const k = 1 - Math.exp(-dt * 4.5);
+  cam.x += (tg.x - cam.x) * k; cam.y += (tg.y - cam.y) * k;
+  shakeAmp *= Math.exp(-dt * 7);
+  const sxk = shakeAmp > .2 ? (Math.random() - .5) * shakeAmp : 0, syk = shakeAmp > .2 ? (Math.random() - .5) * shakeAmp : 0;
+  tr(world, `translate(${(-cam.x + sxk).toFixed(1)},${(-cam.y + syk).toFixed(1)})`);
+  updateParts(dt, t);
+  updateBubbles(t, cam);
+  setZone(zoneOf(gs.hidden ? bs : gs));
+  $('gap').setAttribute('width', (100 * (1 - clamp((bs.x - gs.x - 16) / 120, 0, 1))).toFixed(1));
+  last = t;
+  requestAnimationFrame(frame);
+}
+function reset() {
+  parts.forEach(p => p.e.remove()); parts = [];
+  evIdx = 0; musicIdx = 0; last = 0; curZone = -1; shakeAmp = 0; won = false;
+  $('banner').classList.remove('show'); $('banner').style.color = '';
+  const gs = G.at(0), bs = B.at(0), tg = camTarget(gs, bs);
+  cam.x = tg.x; cam.y = tg.y;
+}
+function paint(t) {
+  for (const f of P) f(t);
+  ambientUpdate(t);
+  const gs = girl.render(t), bs = boy.render(t);
+  const tg = camTarget(gs, bs);
+  cam.x = tg.x; cam.y = tg.y;
+  tr(world, `translate(${-cam.x},${-cam.y})`);
+  updateBubbles(t, cam);
+}
+const overlay = $('overlay'), muteBtn = $('mute');
+function start() {
+  if (!AC) initAudio();
+  AC.resume();
+  reset();
+  t0 = now();
+  running = true;
+  overlay.classList.add('hidden');
+  muteBtn.hidden = false;
+  requestAnimationFrame(frame);
+}
+function showReplay() {
+  overlay.innerHTML = '<button class="btn" id="start">↻ 再看一遍</button>';
+  overlay.style.background = 'transparent';
+  overlay.style.alignItems = 'flex-end'; overlay.style.justifyContent = 'flex-end'; overlay.style.padding = '0 24px 60px 0';
+  overlay.classList.remove('hidden');
+  $('start').addEventListener('click', () => { running = false; overlay.classList.add('hidden'); setTimeout(start, 30); });
+}
+$('start').addEventListener('click', start);
+muteBtn.addEventListener('click', () => {
+  const on = master.gain.value > 0;
+  master.gain.value = on ? 0 : 0.55;
+  muteBtn.textContent = on ? '🔇 静音' : '🔊 声音';
+});
+reset();
+paint(0);
+// 调试：在控制台用 seek(秒) 查看某一时刻
+window.seek = t => { running = false; paint(t); setZone(zoneOf(G.at(t).hidden ? B.at(t) : G.at(t))); return t; };
+window.K = K;
+</script>
+</body>
+</html>
